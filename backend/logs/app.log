@@ -1,0 +1,4 @@
+2026-06-05 23:07:14,099 | INFO     | sign_lang_api | Starting Sign Language API...
+2026-06-05 23:07:14,208 | ERROR    | backend.database | Database connection failed: (pymysql.err.OperationalError) (2003, "Can't connect to MySQL server on '123@localhost' ([Errno 11003] getaddrinfo failed)")
+(Background on this error at: https://sqlalche.me/e/20/e3q8)
+2026-06-05 23:07:14,208 | WARNING  | sign_lang_api | DB unavailable — prediction logging disabled
