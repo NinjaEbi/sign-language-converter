@@ -12,5 +12,6 @@ new_data/
 
 *.h5
 *.keras
+*.tflite
 
 .DS_Store
