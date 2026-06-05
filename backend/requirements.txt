@@ -1,0 +1,24 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+sqlalchemy==2.0.30
+pymysql==1.1.1
+python-dotenv==1.0.1
+pydantic==2.7.1
+cryptography==42.0.7
+
+# ML / CV
+tensorflow==2.20.0
+mediapipe==0.10.35
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+Pillow==10.3.0
+
+# Evaluation
+scikit-learn==1.4.2
+matplotlib==3.8.4
+seaborn==0.13.2
+
+# Utils
+tqdm==4.66.4
+aiofiles==23.2.1
+python-multipart==0.0.9
