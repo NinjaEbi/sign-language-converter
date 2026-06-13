@@ -23,11 +23,8 @@ DELAY_BETWEEN_SEQUENCES = 2  # seconds between recordings
 
 # Adjust this list to your target classes
 CLASS_LABELS = [
-    "hello", "yes", "no", "thanks", "iloveyou",
-    "please", "sorry", "help", "good", "bad",
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
-    "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
-    "U", "V", "W", "X", "Y", "Z"
+    "hello", "yes", "no", "thanks", "help","stop",
+
 ]
 
 # ─────────────────────────────────────────────
@@ -232,7 +229,7 @@ def main():
     print("=" * 60)
     print("\nControls: SPACE = start recording | Q = quit | S = skip class\n")
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 

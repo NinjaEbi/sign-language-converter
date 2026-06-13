@@ -19,7 +19,7 @@ STATIC_DATASET_PATH  = os.path.join("dataset", "raw", "asl_alphabet_train")
 OUTPUT_PATH          = os.path.join("dataset", "processed", "from_static")
 IMG_SIZE             = 224
 SEQUENCE_LENGTH      = 30
-SEQUENCES_PER_IMAGE  = 2      # generate 2 sequences per static image
+SEQUENCES_PER_IMAGE  = 1      # generate 1 sequences per static image
 
 # Subtle augmentation to simulate temporal variation across frames
 TEMPORAL_AUG = {
@@ -126,6 +126,7 @@ def convert_dataset(input_dir, output_dir, seq_per_img, seq_len, img_size, cfg):
 
         images = [f for f in os.listdir(label_in)
                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        images = images[:200]  # limit to 200 images per class for demo
 
         pbar = tqdm(images, desc=f"  [{label:>3}]", ncols=70)
 

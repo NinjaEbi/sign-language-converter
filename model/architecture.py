@@ -1,30 +1,37 @@
 """
-CNN + LSTM architecture for sign language recognition.
-Supports MobileNetV2 and EfficientNetB0 backbones.
-TimeDistributed CNN extracts spatial features per frame,
-stacked Bidirectional LSTM models temporal dynamics.
+UPGRADED: MobileNetV2 + Temporal Transformer architecture.
+Replaces CNN+LSTM with CNN+Transformer for better accuracy
+on sign language recognition.
+
+Why Transformer over LSTM:
+- Attention mechanisms capture which frames matter most
+- No vanishing gradient problem
+- Better parallelization → faster training
+- State-of-the-art on video classification tasks
 """
 
 import tensorflow as tf
 from tensorflow.keras import layers, Model, regularizers
-from tensorflow.keras.applications import (
-    MobileNetV2,
-    EfficientNetB0
-)
-from tensorflow.keras.mixed_precision import set_global_policy
-import sys
-import os
+from tensorflow.keras.applications import MobileNetV2
+import numpy as np
+import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from model.config import *
+from model.config import (
+    IMG_HEIGHT, IMG_WIDTH, CHANNELS, SEQUENCE_LENGTH,
+    GPU_MEMORY_LIMIT, MIXED_PRECISION, L2_REG, DENSE_DROPOUT
+)
 
+
+# ─────────────────────────────────────────────
+# GPU CONFIGURATION
+# ─────────────────────────────────────────────
 
 def configure_gpu():
-    """Configure GPU for optimal RTX 4050 performance."""
+    """Configure GPU for optimal performance."""
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         try:
-            # Limit VRAM usage
             tf.config.set_logical_device_configuration(
                 gpus[0],
                 [tf.config.LogicalDeviceConfiguration(
@@ -32,178 +39,263 @@ def configure_gpu():
                 )]
             )
             print(f"[GPU] Configured: {gpus[0].name} | "
-                  f"Memory limit: {GPU_MEMORY_LIMIT} MB")
+                  f"Limit: {GPU_MEMORY_LIMIT}MB")
         except RuntimeError as e:
             print(f"[GPU] Config error: {e}")
+    else:
+        print("[CPU] No GPU found — running on CPU")
 
-    if MIXED_PRECISION:
+    if MIXED_PRECISION and gpus:
+        from tensorflow.keras.mixed_precision import set_global_policy
         set_global_policy('mixed_float16')
         print("[GPU] Mixed precision (float16) enabled")
 
 
-def build_cnn_backbone(input_shape, backbone_name, pretrained, trainable):
-    """
-    Build CNN feature extractor.
-    input_shape: (H, W, C) — single frame
-    Returns: (base_model, feature_dim)
-    """
-    weights = 'imagenet' if pretrained else None
+# ─────────────────────────────────────────────
+# POSITIONAL ENCODING
+# ─────────────────────────────────────────────
 
-    if backbone_name == "mobilenetv2":
-        base = MobileNetV2(
-            input_shape=input_shape,
-            include_top=False,
-            weights=weights,
-            pooling='avg'
+class PositionalEncoding(layers.Layer):
+    """
+    Sinusoidal positional encoding.
+    Tells the Transformer the temporal order of frames.
+    Without this, attention treats frames as a bag (no order).
+    """
+    def __init__(self, max_len, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.max_len = max_len
+        self.d_model = d_model
+
+        # Compute fixed sinusoidal encodings
+        positions = np.arange(max_len)[:, np.newaxis]       # (max_len, 1)
+        dims      = np.arange(d_model)[np.newaxis, :]        # (1, d_model)
+        angles    = positions / np.power(10000, (2 * (dims // 2)) / d_model)
+
+        # Apply sin to even indices, cos to odd indices
+        angles[:, 0::2] = np.sin(angles[:, 0::2])
+        angles[:, 1::2] = np.cos(angles[:, 1::2])
+
+        self.encoding = tf.cast(
+            angles[np.newaxis, :, :], dtype=tf.float32
+        )  # (1, max_len, d_model)
+
+    def call(self, x):
+        seq_len = tf.shape(x)[1]
+        return x + self.encoding[:, :seq_len, :]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"max_len": self.max_len, "d_model": self.d_model})
+        return config
+
+
+# ─────────────────────────────────────────────
+# TRANSFORMER ENCODER BLOCK
+# ─────────────────────────────────────────────
+
+class TransformerEncoderBlock(layers.Layer):
+    """
+    Single Transformer encoder block.
+    Multi-Head Self-Attention + Feed Forward + Residual + LayerNorm.
+
+    d_model:   feature dimension (must match CNN output projection)
+    num_heads: number of attention heads
+    ff_dim:    feed-forward inner dimension
+    dropout:   dropout rate
+    """
+    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model   = d_model
+        self.num_heads = num_heads
+        self.ff_dim    = ff_dim
+        self.dropout_rate = dropout
+
+        self.attention   = layers.MultiHeadAttention(
+            num_heads  = num_heads,
+            key_dim    = d_model // num_heads,
+            dropout    = dropout,
         )
-        feature_dim = 1280
+        self.ffn = tf.keras.Sequential([
+            layers.Dense(ff_dim, activation='gelu',
+                          kernel_regularizer=regularizers.l2(L2_REG)),
+            layers.Dropout(dropout),
+            layers.Dense(d_model,
+                          kernel_regularizer=regularizers.l2(L2_REG)),
+        ])
+        self.norm1   = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2   = layers.LayerNormalization(epsilon=1e-6)
+        self.drop1   = layers.Dropout(dropout)
+        self.drop2   = layers.Dropout(dropout)
 
-    elif backbone_name == "efficientnetb0":
-        base = EfficientNetB0(
-            input_shape=input_shape,
-            include_top=False,
-            weights=weights,
-            pooling='avg'
-        )
-        feature_dim = 1280
+    def call(self, x, training=False):
+        # Multi-head self-attention with residual
+        attn_out = self.attention(x, x, training=training)
+        x = self.norm1(x + self.drop1(attn_out, training=training))
 
-    elif backbone_name == "custom":
-        # Lightweight custom CNN for low-resource deployment
-        inp = tf.keras.Input(shape=input_shape)
-        x   = layers.Conv2D(32, 3, padding='same', activation='relu')(inp)
-        x   = layers.BatchNormalization()(x)
-        x   = layers.MaxPooling2D(2)(x)
+        # Feed-forward with residual
+        ffn_out = self.ffn(x, training=training)
+        x = self.norm2(x + self.drop2(ffn_out, training=training))
+        return x
 
-        x   = layers.Conv2D(64, 3, padding='same', activation='relu')(x)
-        x   = layers.BatchNormalization()(x)
-        x   = layers.MaxPooling2D(2)(x)
-
-        x   = layers.Conv2D(128, 3, padding='same', activation='relu')(x)
-        x   = layers.BatchNormalization()(x)
-        x   = layers.MaxPooling2D(2)(x)
-
-        x   = layers.Conv2D(256, 3, padding='same', activation='relu')(x)
-        x   = layers.BatchNormalization()(x)
-        x   = layers.GlobalAveragePooling2D()(x)
-        base = tf.keras.Model(inputs=inp, outputs=x, name="custom_cnn")
-        feature_dim = 256
-
-    else:
-        raise ValueError(f"Unknown backbone: {backbone_name}")
-
-    base.trainable = trainable
-    return base, feature_dim
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "d_model":   self.d_model,
+            "num_heads": self.num_heads,
+            "ff_dim":    self.ff_dim,
+            "dropout":   self.dropout_rate,
+        })
+        return config
 
 
-def build_model(num_classes,
-                backbone=CNN_BACKBONE,
-                pretrained=CNN_PRETRAINED,
-                cnn_trainable=CNN_TRAINABLE,
-                lstm_units=None,
-                dense_units=None):
+# ─────────────────────────────────────────────
+# FULL MODEL
+# ─────────────────────────────────────────────
+
+def build_model(
+    num_classes,
+    d_model      = 256,    # Transformer hidden dimension
+    num_heads    = 4,      # Attention heads
+    ff_dim       = 512,    # Feed-forward dimension
+    num_layers   = 2,      # Transformer encoder layers
+    dropout      = 0.1,
+    cnn_trainable = False,
+):
     """
-    Full CNN + LSTM model.
+    MobileNetV2 + Temporal Transformer for sign language recognition.
 
     Architecture:
-      Input(seq_len, H, W, C)
-      → TimeDistributed(MobileNetV2) → (seq_len, feature_dim)
-      → Bidirectional LSTM × N
-      → Dense → Dropout
-      → Softmax output
+      Input(30, 224, 224, 3)
+      → TimeDistributed(MobileNetV2)  → (30, 1280)
+      → Dense projection              → (30, d_model)
+      → PositionalEncoding            → (30, d_model)
+      → TransformerEncoder × N        → (30, d_model)
+      → GlobalAveragePooling1D        → (d_model,)
+      → Dense(256) → Dropout
+      → Dense(num_classes) → Softmax
 
     Args:
-        num_classes: number of sign classes
-    Returns:
-        Keras Model
+        num_classes:   number of sign language classes
+        d_model:       transformer hidden dimension
+        num_heads:     multi-head attention heads
+        ff_dim:        feed-forward layer size
+        num_layers:    number of transformer blocks
+        dropout:       dropout rate throughout
+        cnn_trainable: whether CNN backbone is trainable
     """
-    if lstm_units  is None: lstm_units  = LSTM_UNITS
-    if dense_units is None: dense_units = DENSE_UNITS
 
-    frame_shape  = (IMG_HEIGHT, IMG_WIDTH, CHANNELS)
-    cnn, feat_dim = build_cnn_backbone(frame_shape, backbone,
-                                        pretrained, cnn_trainable)
+    # ── CNN Backbone ──
+    cnn_backbone = MobileNetV2(
+        input_shape = (IMG_HEIGHT, IMG_WIDTH, CHANNELS),
+        include_top = False,
+        weights     = 'imagenet',
+        pooling     = 'avg',
+    )
+    cnn_backbone.trainable = cnn_trainable
 
-    # Input
+    # ── Input ──
     sequence_input = tf.keras.Input(
-        shape=(SEQUENCE_LENGTH, IMG_HEIGHT, IMG_WIDTH, CHANNELS),
-        name="sequence_input"
+        shape = (SEQUENCE_LENGTH, IMG_HEIGHT, IMG_WIDTH, CHANNELS),
+        name  = "sequence_input"
     )
 
-    # TimeDistributed CNN — apply same CNN to each frame
-    x = layers.TimeDistributed(cnn, name="td_cnn")(sequence_input)
-    # x shape: (batch, seq_len, feature_dim)
+    # ── Feature extraction per frame ──
+    # MobileNetV2 output: (batch, 30, 1280)
+    x = layers.TimeDistributed(cnn_backbone, name="td_mobilenet")(sequence_input)
 
-    # Optional: lightweight temporal attention on CNN features
-    # (helps model focus on key frames)
-    x = frame_attention(x, feat_dim)
+    # ── Project to d_model dimensions ──
+    # (batch, 30, 1280) → (batch, 30, d_model)
+    x = layers.TimeDistributed(
+        layers.Dense(
+            d_model,
+            activation = 'relu',
+            kernel_regularizer = regularizers.l2(L2_REG),
+        ),
+        name = "feature_projection"
+    )(x)
+    x = layers.TimeDistributed(
+        layers.LayerNormalization(epsilon=1e-6),
+        name = "projection_norm"
+    )(x)
+    x = layers.Dropout(dropout, name="projection_dropout")(x)
 
-    # Stacked Bidirectional LSTM
-    for i, units in enumerate(lstm_units):
-        return_seq = (i < len(lstm_units) - 1)  # return sequences for all but last
-        x = layers.Bidirectional(
-            layers.LSTM(
-                units,
-                return_sequences=return_seq,
-                dropout=LSTM_DROPOUT,
-                recurrent_dropout=LSTM_RECURRENT_DROPOUT,
-                kernel_regularizer=regularizers.l2(L2_REG),
-            ),
-            name=f"bilstm_{i}"
+    # ── Positional encoding ──
+    x = PositionalEncoding(
+        max_len = SEQUENCE_LENGTH,
+        d_model = d_model,
+        name    = "positional_encoding"
+    )(x)
+
+    # ── Transformer encoder blocks ──
+    for i in range(num_layers):
+        x = TransformerEncoderBlock(
+            d_model   = d_model,
+            num_heads = num_heads,
+            ff_dim    = ff_dim,
+            dropout   = dropout,
+            name      = f"transformer_block_{i}"
         )(x)
-        if return_seq:
-            x = layers.LayerNormalization(name=f"layernorm_{i}")(x)
 
-    # Dense classification head
-    for j, units in enumerate(dense_units):
-        x = layers.Dense(
-            units,
-            activation='relu',
-            kernel_regularizer=regularizers.l2(L2_REG),
-            name=f"dense_{j}"
-        )(x)
-        x = layers.BatchNormalization(name=f"bn_dense_{j}")(x)
-        x = layers.Dropout(DENSE_DROPOUT, name=f"dropout_dense_{j}")(x)
+    # ── Aggregate temporal dimension ──
+    # Mean pooling across all 30 frames
+    x = layers.GlobalAveragePooling1D(name="temporal_pooling")(x)
 
-    # Output — cast to float32 for numerical stability with mixed precision
+    # ── Classification head ──
+    x = layers.Dense(
+        256,
+        activation = 'relu',
+        kernel_regularizer = regularizers.l2(L2_REG),
+        name = "head_dense_1"
+    )(x)
+    x = layers.BatchNormalization(name="head_bn")(x)
+    x = layers.Dropout(DENSE_DROPOUT, name="head_dropout")(x)
+
+    x = layers.Dense(
+        128,
+        activation = 'relu',
+        kernel_regularizer = regularizers.l2(L2_REG),
+        name = "head_dense_2"
+    )(x)
+    x = layers.Dropout(DENSE_DROPOUT * 0.5, name="head_dropout_2")(x)
+
+    # ── Output ──
     output = layers.Dense(num_classes, name="logits")(x)
-    output = layers.Activation('softmax', dtype='float32', name="output")(output)
+    output = layers.Activation(
+        'softmax', dtype='float32', name="output"
+    )(output)
 
-    model = Model(inputs=sequence_input, outputs=output, name="SignLangCNN_LSTM")
+    model = Model(
+        inputs  = sequence_input,
+        outputs = output,
+        name    = "SignLang_MobileNetV2_Transformer"
+    )
     return model
 
 
-def frame_attention(x, feat_dim):
-    """
-    Soft attention over temporal sequence.
-    Learns which frames are most discriminative.
-    """
-    # x: (batch, seq_len, feat_dim)
-    score = layers.Dense(1, name="attn_score")(x)           # (batch, seq_len, 1)
-    weight = layers.Softmax(axis=1, name="attn_weight")(score)
-    attended = layers.Multiply(name="attn_apply")([x, weight])  # (batch, seq_len, feat_dim)
-    # Add residual connection
-    x = layers.Add(name="attn_residual")([x, attended])
-    x = layers.LayerNormalization(name="attn_norm")(x)
-    return x
+# ─────────────────────────────────────────────
+# FINE-TUNING HELPERS
+# ─────────────────────────────────────────────
 
-
-def unfreeze_cnn_top_layers(model, n_layers):
-    """Unfreeze top N layers of the CNN backbone for fine-tuning."""
-    td_cnn = None
+def unfreeze_cnn_top_layers(model, n_layers=30):
+    """
+    Unfreeze the top N layers of the MobileNetV2 backbone.
+    Used in Stage 2 (fine-tuning) to adapt pretrained features
+    to sign language domain.
+    """
+    td_layer = None
     for layer in model.layers:
-        if layer.name == "td_cnn":
-            td_cnn = layer
+        if layer.name == "td_mobilenet":
+            td_layer = layer
             break
 
-    if td_cnn is None:
-        print("[WARN] Could not find td_cnn layer for unfreezing")
+    if td_layer is None:
+        print("[WARN] td_mobilenet layer not found")
         return
 
-    cnn = td_cnn.layer
+    cnn    = td_layer.layer
+    total  = len(cnn.layers)
     cnn.trainable = True
 
-    # Freeze all but last n_layers
-    total = len(cnn.layers)
     for layer in cnn.layers[:total - n_layers]:
         layer.trainable = False
     for layer in cnn.layers[total - n_layers:]:
@@ -215,13 +307,16 @@ def unfreeze_cnn_top_layers(model, n_layers):
 
 
 def get_model_summary(model):
-    """Print model summary with parameter count."""
-    total_params     = model.count_params()
-    trainable_params = sum(tf.size(w).numpy() for w in model.trainable_weights)
-    print(f"\n{'='*50}")
-    print(f"  Model: {model.name}")
-    print(f"  Total params    : {total_params:,}")
-    print(f"  Trainable params: {trainable_params:,}")
-    print(f"  Input shape     : {model.input_shape}")
-    print(f"  Output shape    : {model.output_shape}")
-    print(f"{'='*50}\n")
+    total      = model.count_params()
+    trainable  = sum(
+        tf.size(w).numpy() for w in model.trainable_weights
+    )
+    non_train  = total - trainable
+    print(f"\n{'='*55}")
+    print(f"  Model : {model.name}")
+    print(f"  Total params     : {total:>12,}")
+    print(f"  Trainable params : {trainable:>12,}")
+    print(f"  Frozen params    : {non_train:>12,}")
+    print(f"  Input shape      : {model.input_shape}")
+    print(f"  Output shape     : {model.output_shape}")
+    print(f"{'='*55}\n")
